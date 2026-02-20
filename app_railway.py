@@ -10,15 +10,15 @@ import boto3
 import json
 
 # -----------------------
-# Paramètres S3
+# Paramètres S3 depuis variables d'environnement
 # -----------------------
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
 
-# Fichiers clients
-MAIN_CLIENTS_FILE = "Tous_les_clients.json"          # Pour ajout / modification
-COMPARE_CLIENTS_FILE = "Clients_supplementaires.json"  # Pour comparatif seulement
+# Fichiers clients depuis variables d'environnement
+MAIN_CLIENTS_FILE = os.environ.get("CLIENTS_MAIN_FILE")        
+COMPARE_CLIENTS_FILE = os.environ.get("CLIENTS_COMPARE_FILE")  
 
 # -----------------------
 # Connexion S3
@@ -36,6 +36,7 @@ def load_clients_from_s3(filename):
     df["source_file"] = filename
     return df
 
+# Chargement des clients
 clients_df_main = load_clients_from_s3(MAIN_CLIENTS_FILE)
 clients_df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE)
 
@@ -62,8 +63,8 @@ if 'index' in top_features:
 # -----------------------
 # API endpoints
 # -----------------------
-API_PREDICT_URL = "https://credit-scoring-api-tqja.onrender.com/predict"
-API_EXPLAIN_URL = "https://credit-scoring-api-tqja.onrender.com/explain"
+API_PREDICT_URL = os.environ.get("API_PREDICT_URL")  # Optionnel via variable d'environnement
+API_EXPLAIN_URL = os.environ.get("API_EXPLAIN_URL")  # Optionnel via variable d'environnement
 
 def call_api(url, payload):
     try:
@@ -126,7 +127,7 @@ app.layout = html.Div([
 ])
 
 # -----------------------
-# Callbacks Tabs
+# Callbacks pour Tabs
 # -----------------------
 @app.callback(
     Output("tabs-content", "children"),
@@ -140,8 +141,8 @@ def update_tabs(tab, selected_client):
     client_data = clients_df.loc[selected_client].to_dict()
     client_data = {feat: float(client_data.get(feat, 0)) for feat in top_features}
 
+    # ------------------- Tab Risque de défaut -------------------
     if tab=="tab-gauge":
-        # Appel API Predict
         res = call_api(API_PREDICT_URL, client_data)
         if res:
             proba = res.get("proba",0)
@@ -166,7 +167,7 @@ def update_tabs(tab, selected_client):
             }
         ))
 
-        # Appel API Explain (SHAP)
+        # SHAP
         shap_res = call_api(API_EXPLAIN_URL, client_data)
         if shap_res:
             shap_vals = [shap_res[f] for f in top_features]
@@ -199,6 +200,7 @@ def update_tabs(tab, selected_client):
                 dcc.Graph(figure=fig_gauge)
             ])
 
+    # ------------------- Tab Distribution -------------------
     elif tab=="tab-distrib":
         return html.Div([
             html.Label("Choisir une feature pour comparer le client :"),
@@ -211,6 +213,7 @@ def update_tabs(tab, selected_client):
             html.Div(id="output-hist-distrib")
         ])
 
+    # ------------------- Tab Scatter -------------------
     elif tab=="tab-scatter":
         return html.Div([
             html.Label("Choisir 2 features pour scatter plot :"),
@@ -229,6 +232,7 @@ def update_tabs(tab, selected_client):
             html.Div(id="output-scatter")
         ])
 
+    # ------------------- Tab Ajouter client -------------------
     elif tab=="tab-add-client":
         median_vals = clients_df.median()
         return html.Div([
@@ -270,7 +274,7 @@ def update_hist(feature, selected_client):
                           xaxis_title=feature, yaxis_title="Nombre de clients",
                           width=900, height=500)
 
-    # Distribution Crédit accordé
+    # Crédit accordé
     fig_target0 = go.Figure()
     fig_target0.add_trace(go.Histogram(
         x=df_plot[df_plot["TARGET"]==0][feature],
@@ -285,7 +289,7 @@ def update_hist(feature, selected_client):
                               xaxis_title=feature, yaxis_title="Nombre de clients",
                               width=900, height=500)
 
-    # Distribution Crédit refusé
+    # Crédit refusé
     fig_target1 = go.Figure()
     fig_target1.add_trace(go.Histogram(
         x=df_plot[df_plot["TARGET"]==1][feature],
@@ -349,7 +353,6 @@ def add_client(n_clicks, name, *vals):
     if n_clicks > 0 and name:
         vals_dict = {f: v if v is not None else float(clients_df[f].median()) 
                      for f, v in zip(top_features, vals)}
-
         new_row = pd.DataFrame([vals_dict], index=[name])
         clients_df = pd.concat([new_row, clients_df])
 

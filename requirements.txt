@@ -1,1 +1,1 @@
-pip>=23.0setuptools>=68.0wheel>=0.40dash==2.16.1dash-bootstrap-components==1.4.2pandas==2.0.3requestsboto3plotly  
+numpy==1.26.4pandas==2.0.3dash==2.16.1dash-bootstrap-components==1.4.2boto3==1.42.53requests==2.32.5  

@@ -3,53 +3,67 @@ from dash import html, dcc
 from dash.dependencies import Input, Output, State
 import pandas as pd
 import requests
-import io
 import plotly.express as px
 import plotly.graph_objects as go
 import os
 import boto3
 import json
 
-#s3
+# -----------------------
 # Paramètres S3
+# -----------------------
 AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
-CLIENTS_FILE = os.environ.get("CLIENTS_FILE")
 
+# Fichiers clients
+MAIN_CLIENTS_FILE = "Tous_les_clients.json"          # Pour ajout / modification
+COMPARE_CLIENTS_FILE = "Clients_supplementaires.json"  # Pour comparatif seulement
+
+# -----------------------
+# Connexion S3
+# -----------------------
 s3 = boto3.client(
     "s3",
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-def load_clients_from_s3():
-    obj = s3.get_object(Bucket=BUCKET_NAME, Key=CLIENTS_FILE)
+def load_clients_from_s3(filename):
+    obj = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
     data = json.load(obj["Body"])
     df = pd.DataFrame(data)
+    df["source_file"] = filename
     return df
 
-clients_df = load_clients_from_s3()
+clients_df_main = load_clients_from_s3(MAIN_CLIENTS_FILE)
+clients_df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE)
 
-def save_clients_to_s3(df):
-    data = df.to_dict(orient="records")
+# Dataframes concaténés
+clients_df = pd.concat([clients_df_main, clients_df_extra])
+df_compar = clients_df.copy()
+
+def save_clients_to_s3(df, filename):
+    data = df.drop(columns=["source_file"], errors="ignore").to_dict(orient="records")
     s3.put_object(
         Bucket=BUCKET_NAME,
-        Key=CLIENTS_FILE,
+        Key=filename,
         Body=json.dumps(data),
         ContentType="application/json"
     )
 
-
+# -----------------------
+# Liste des features
+# -----------------------
 top_features = list(clients_df.columns)
 if 'index' in top_features:
     top_features.remove('index')
 
-
-
+# -----------------------
+# API endpoints
+# -----------------------
 API_PREDICT_URL = "https://credit-scoring-api-tqja.onrender.com/predict"
 API_EXPLAIN_URL = "https://credit-scoring-api-tqja.onrender.com/explain"
-
 
 def call_api(url, payload):
     try:
@@ -62,6 +76,9 @@ def call_api(url, payload):
         print(f"Erreur API {url}: {e}")
         return None
 
+# -----------------------
+# Fonctions utilitaires
+# -----------------------
 def convert_days_birth(value):
     return int(-value / 365)
 
@@ -75,12 +92,16 @@ def prepare_dataframe(df, feat_list):
             df_copy[feat] = df_copy[feat].apply(convert_days_birth)
     return df_copy
 
-
+# -----------------------
+# Dash App
+# -----------------------
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
 app.title = "Dashboard Crédit"
 
-
+# -----------------------
+# Layout
+# -----------------------
 app.layout = html.Div([
     html.H1("Dashboard Crédit", style={"textAlign":"center"}),
 
@@ -104,7 +125,9 @@ app.layout = html.Div([
     html.Div(id="tabs-content", style={"marginTop":20})
 ])
 
-
+# -----------------------
+# Callbacks Tabs
+# -----------------------
 @app.callback(
     Output("tabs-content", "children"),
     [Input("tabs-dashboard", "value"),
@@ -143,7 +166,7 @@ def update_tabs(tab, selected_client):
             }
         ))
 
-        # 
+        # Appel API Explain (SHAP)
         shap_res = call_api(API_EXPLAIN_URL, client_data)
         if shap_res:
             shap_vals = [shap_res[f] for f in top_features]
@@ -177,7 +200,6 @@ def update_tabs(tab, selected_client):
             ])
 
     elif tab=="tab-distrib":
-       
         return html.Div([
             html.Label("Choisir une feature pour comparer le client :"),
             dcc.Dropdown(
@@ -219,7 +241,9 @@ def update_tabs(tab, selected_client):
                 value=float(median_vals[f]))]) for f in top_features]
         ])
 
-
+# -----------------------
+# Callback Distribution
+# -----------------------
 @app.callback(
     Output("output-hist-distrib","children"),
     [Input("select-feature-distrib","value"),
@@ -227,10 +251,11 @@ def update_tabs(tab, selected_client):
 )
 def update_hist(feature, selected_client):
     client_val = prepare_client_value(feature, clients_df.loc[selected_client][feature])
-    df_plot = df_compar.copy()  
+    df_plot = df_compar.copy()
     if feature=="DAYS_BIRTH":
         df_plot[feature] = df_plot[feature].apply(convert_days_birth)
 
+    # Distribution globale
     fig_all = go.Figure()
     fig_all.add_trace(go.Histogram(
         x=df_plot[feature],
@@ -241,10 +266,11 @@ def update_hist(feature, selected_client):
     ))
     fig_all.add_vline(x=client_val, line_color="blue", line_width=3,
                       annotation_text="Client", annotation_position="top")
-    fig_all.update_layout(title=f"Position du client dans la distribution globale de {feature}",
-                          xaxis_title=feature, yaxis_title="Nombre de clients", legend_title="Légende",
+    fig_all.update_layout(title=f"Distribution globale de {feature}",
+                          xaxis_title=feature, yaxis_title="Nombre de clients",
                           width=900, height=500)
 
+    # Distribution Crédit accordé
     fig_target0 = go.Figure()
     fig_target0.add_trace(go.Histogram(
         x=df_plot[df_plot["TARGET"]==0][feature],
@@ -255,10 +281,11 @@ def update_hist(feature, selected_client):
     ))
     fig_target0.add_vline(x=client_val, line_color="blue", line_width=3,
                           annotation_text="Client", annotation_position="top")
-    fig_target0.update_layout(title=f"Position du client parmi les crédits accordés (0) pour {feature}",
-                              xaxis_title=feature, yaxis_title="Nombre de clients", legend_title="Légende",
+    fig_target0.update_layout(title=f"Crédit accordé (0) pour {feature}",
+                              xaxis_title=feature, yaxis_title="Nombre de clients",
                               width=900, height=500)
 
+    # Distribution Crédit refusé
     fig_target1 = go.Figure()
     fig_target1.add_trace(go.Histogram(
         x=df_plot[df_plot["TARGET"]==1][feature],
@@ -269,15 +296,17 @@ def update_hist(feature, selected_client):
     ))
     fig_target1.add_vline(x=client_val, line_color="blue", line_width=3,
                           annotation_text="Client", annotation_position="top")
-    fig_target1.update_layout(title=f"Position du client parmi les crédits refusés (1) pour {feature}",
-                              xaxis_title=feature, yaxis_title="Nombre de clients", legend_title="Légende",
+    fig_target1.update_layout(title=f"Crédit refusé (1) pour {feature}",
+                              xaxis_title=feature, yaxis_title="Nombre de clients",
                               width=900, height=500)
 
     return html.Div([dcc.Graph(figure=fig_all),
                      dcc.Graph(figure=fig_target0),
                      dcc.Graph(figure=fig_target1)])
 
-
+# -----------------------
+# Callback Scatter
+# -----------------------
 @app.callback(
     Output("output-scatter","children"),
     [Input("select-feature-scatter-x","value"),
@@ -304,7 +333,9 @@ def update_scatter(x_feat, y_feat, selected_client):
 
     return dcc.Graph(figure=fig_scatter)
 
-
+# -----------------------
+# Callback Ajouter client
+# -----------------------
 @app.callback(
     [Output("select-client","options"),
      Output("select-client","value")], 
@@ -314,25 +345,26 @@ def update_scatter(x_feat, y_feat, selected_client):
 )
 def add_client(n_clicks, name, *vals):
     global clients_df
-    
+
     if n_clicks > 0 and name:
         vals_dict = {f: v if v is not None else float(clients_df[f].median()) 
                      for f, v in zip(top_features, vals)}
-        
+
         new_row = pd.DataFrame([vals_dict], index=[name])
         clients_df = pd.concat([new_row, clients_df])
-        
-        # 🔹 Sauvegarde automatique sur S3
-        save_clients_to_s3(clients_df)
-    
+
+        # 🔹 Sauvegarde sur S3
+        save_clients_to_s3(clients_df, MAIN_CLIENTS_FILE)
+
     options = [{"label": idx, "value": idx} for idx in clients_df.index]
     selected = name if n_clicks > 0 else clients_df.index[0]
-    
+
     return options, selected
 
-
+# -----------------------
+# Run server
+# -----------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8050))
     app.run_server(debug=True, host="0.0.0.0", port=port)
-
 

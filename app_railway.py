@@ -62,7 +62,11 @@ except Exception as e:
 def load_clients_from_s3(filename, nrows=None):
     try:
         obj = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
-        data = json.load(obj["Body"])
+        data = json.load(obj["Body"])  
+        # Si c'est une dict, on prend ses valeurs
+        if isinstance(data, dict):
+            data = list(data.values())
+        # Si nrows est défini, on prend juste les premières lignes
         if nrows is not None:
             data = data[:nrows]
         df = pd.DataFrame(data)
@@ -71,7 +75,7 @@ def load_clients_from_s3(filename, nrows=None):
     except Exception as e:
         print(f"Erreur lors du chargement du fichier {filename} depuis S3 :")
         traceback.print_exc()
-        return pd.DataFrame()  
+        return pd.DataFrame()  # Retourne un DataFrame vide en cas d'erreur
     
 def save_clients_to_s3(df, filename):
     try:

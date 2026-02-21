@@ -1,119 +1,108 @@
 import traceback
-
-try:
-    import os
-    import json
-    import boto3
-    import pandas as pd
-    from dash import Dash, dcc, html
-    # ... tous tes imports
-except Exception as e:
-    print("Erreur pendant les imports :")
-    traceback.print_exc()
-    raise
-
-# Ensuite ton code principal
-try:
-    # code principal : connexion S3, chargement fichiers, etc.
-    print("Variables d'environnement :")
-    print("AWS_ACCESS_KEY_ID:", os.environ.get("AWS_ACCESS_KEY_ID"))
-    print("BUCKET_NAME:", os.environ.get("BUCKET_NAME"))
-    print("MAIN_CLIENTS_FILE:", os.environ.get("CLIENTS_MAIN_FILE"))
-    print("COMPARE_CLIENTS_FILE:", os.environ.get("CLIENTS_COMPARE_FILE"))
-
-    # Test connexion S3
-    s3 = boto3.client(
-        's3',
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY")
-    )
-    # lister les fichiers pour vérifier
-    print("Fichiers dans le bucket :")
-    files = s3.list_objects_v2(Bucket=os.environ.get("BUCKET_NAME"))
-    if 'Contents' in files:
-        for f in files['Contents']:
-            print(f["Key"])
-    else:
-        print("Aucun fichier trouvé dans le bucket !")
-
-except Exception as e:
-    print("Erreur pendant le setup / S3 / variables :")
-    traceback.print_exc()
-    raise
+import os
+import json
+import boto3
+import pandas as pd
 import dash
 from dash import html, dcc
 from dash.dependencies import Input, Output, State
-import pandas as pd
 import requests
 import plotly.express as px
 import plotly.graph_objects as go
-import os
-import boto3
-import json
 
 # -----------------------
-# Paramètres S3 depuis variables d'environnement
+# Vérification des variables d'environnement
 # -----------------------
-AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
-BUCKET_NAME = os.environ.get("BUCKET_NAME")
+required_env_vars = [
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "BUCKET_NAME",
+    "CLIENTS_MAIN_FILE", "CLIENTS_COMPARE_FILE"
+]
 
-# Fichiers clients depuis variables d'environnement
-MAIN_CLIENTS_FILE = os.environ.get("CLIENTS_MAIN_FILE")        
-COMPARE_CLIENTS_FILE = os.environ.get("CLIENTS_COMPARE_FILE")  
+for var in required_env_vars:
+    if not os.environ.get(var):
+        raise EnvironmentError(f"La variable d'environnement {var} n'est pas définie !")
+
+AWS_ACCESS_KEY_ID = os.environ["AWS_ACCESS_KEY_ID"]
+AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
+BUCKET_NAME = os.environ["BUCKET_NAME"]
+MAIN_CLIENTS_FILE = os.environ["CLIENTS_MAIN_FILE"]
+COMPARE_CLIENTS_FILE = os.environ["CLIENTS_COMPARE_FILE"]
+
+API_PREDICT_URL = os.environ.get("API_PREDICT_URL")
+API_EXPLAIN_URL = os.environ.get("API_EXPLAIN_URL")
+
+if not API_PREDICT_URL:
+    print("⚠️ API_PREDICT_URL non défini ! Les prédictions ne fonctionneront pas.")
+if not API_EXPLAIN_URL:
+    print("⚠️ API_EXPLAIN_URL non défini ! Les explications SHAP ne fonctionneront pas.")
 
 # -----------------------
 # Connexion S3
 # -----------------------
-s3 = boto3.client(
-    "s3",
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
-)
+try:
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+    )
+    # Vérification rapide du bucket
+    files = s3.list_objects_v2(Bucket=BUCKET_NAME)
+    if 'Contents' in files:
+        print("Fichiers dans le bucket :", [f["Key"] for f in files['Contents']])
+    else:
+        print("⚠️ Aucun fichier trouvé dans le bucket !")
+except Exception as e:
+    print("Erreur lors de la connexion S3 :")
+    traceback.print_exc()
+    raise
 
+# -----------------------
+# Fonctions S3
+# -----------------------
 def load_clients_from_s3(filename, nrows=None):
-    """Charge les clients depuis S3. Si nrows est spécifié, ne prend que les n premières lignes."""
-    obj = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
-    data = json.load(obj["Body"])
+    try:
+        obj = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
+        data = json.load(obj["Body"])
+        if nrows is not None:
+            data = data[:nrows]
+        df = pd.DataFrame(data)
+        df["source_file"] = filename
+        return df
+    except Exception as e:
+        print(f"Erreur lors du chargement du fichier {filename} depuis S3 :")
+        traceback.print_exc()
+        return pd.DataFrame()  
     
-    if nrows is not None:
-        data = data[:nrows]  
-    
-    df = pd.DataFrame(data)
-    df["source_file"] = filename
-    return df
+def save_clients_to_s3(df, filename):
+    try:
+        data = df.drop(columns=["source_file"], errors="ignore").to_dict(orient="records")
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=filename,
+            Body=json.dumps(data),
+            ContentType="application/json"
+        )
+    except Exception as e:
+        print(f"Erreur lors de la sauvegarde du fichier {filename} sur S3 :")
+        traceback.print_exc()
 
-# Chargement des clients
+# -----------------------
+# Chargement clients
+# -----------------------
 clients_df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=5000)
 clients_df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=5000)
-
-# Dataframes concaténés
 clients_df = pd.concat([clients_df_main, clients_df_extra])
 df_compar = clients_df.copy()
 
-def save_clients_to_s3(df, filename):
-    data = df.drop(columns=["source_file"], errors="ignore").to_dict(orient="records")
-    s3.put_object(
-        Bucket=BUCKET_NAME,
-        Key=filename,
-        Body=json.dumps(data),
-        ContentType="application/json"
-    )
-
-# -----------------------
 # Liste des features
-# -----------------------
-top_features = list(clients_df.columns)
-if 'index' in top_features:
-    top_features.remove('index')
+top_features = [f for f in clients_df.columns if f != "index"]
 
 # -----------------------
-# API endpoints
+# Fonctions API
 # -----------------------
-API_PREDICT_URL = os.environ.get("API_PREDICT_URL")  # Optionnel via variable d'environnement
-API_EXPLAIN_URL = os.environ.get("API_EXPLAIN_URL")  # Optionnel via variable d'environnement
-
 def call_api(url, payload):
+    if not url:
+        return None
     try:
         res = requests.post(url, json=payload).json()
         if "error" in res:
@@ -152,18 +141,15 @@ app.title = "Dashboard Crédit"
 # -----------------------
 app.layout = html.Div([
     html.H1("Dashboard Crédit", style={"textAlign":"center"}),
-
     html.Div([  
         html.Label("Choisir un client :"),
         dcc.Dropdown(
             id="select-client",
             options=[{"label": idx, "value": idx} for idx in clients_df.index],
-            value=clients_df.index[0]
+            value=clients_df.index[0] if len(clients_df) > 0 else None
         )
     ], style={"width":"40%","margin":"auto"}),
-
     html.Br(),
-
     dcc.Tabs(id="tabs-dashboard", value="tab-gauge", children=[
         dcc.Tab(label="Risque de défaut", value="tab-gauge"),
         dcc.Tab(label="Comparaison client", value="tab-distrib"),
@@ -174,7 +160,7 @@ app.layout = html.Div([
 ])
 
 # -----------------------
-# Callbacks pour Tabs
+# Callback Tabs
 # -----------------------
 @app.callback(
     Output("tabs-content", "children"),
@@ -182,13 +168,12 @@ app.layout = html.Div([
      Input("select-client", "value")]
 )
 def update_tabs(tab, selected_client):
-    if not selected_client:
+    if selected_client is None:
         return html.Div("Sélectionnez un client")
 
     client_data = clients_df.loc[selected_client].to_dict()
     client_data = {feat: float(client_data.get(feat, 0)) for feat in top_features}
 
-    # ------------------- Tab Risque de défaut -------------------
     if tab=="tab-gauge":
         res = call_api(API_PREDICT_URL, client_data)
         if res:
@@ -204,82 +189,56 @@ def update_tabs(tab, selected_client):
             mode="gauge+number",
             value=proba*100,
             title={'text': "Probabilité de défaut (%)"},
-            gauge={
-                'axis': {'range':[0,100]},
-                'bar': {'color': 'black'},
-                'steps': [
-                    {'range':[0,90],'color':'green'},
-                    {'range':[90,100],'color':'red'}
-                ]
-            }
+            gauge={'axis': {'range':[0,100]},
+                   'bar': {'color': 'black'},
+                   'steps':[{'range':[0,90],'color':'green'},
+                            {'range':[90,100],'color':'red'}]}
         ))
 
-        # SHAP
         shap_res = call_api(API_EXPLAIN_URL, client_data)
         if shap_res:
-            shap_vals = [shap_res[f] for f in top_features]
+            shap_vals = [shap_res.get(f,0) for f in top_features]
             shap_df = pd.DataFrame({"Feature": top_features, "SHAP": shap_vals})
             shap_df = shap_df.reindex(shap_df["SHAP"].abs().sort_values(ascending=False).index).head(10)
 
-            fig_shap = go.Figure()
-            fig_shap.add_trace(go.Bar(
+            fig_shap = go.Figure(go.Bar(
                 x=shap_df["SHAP"],
                 y=shap_df["Feature"],
                 orientation='h',
                 marker_color=['red' if v>0 else 'blue' for v in shap_df["SHAP"]]
             ))
-            fig_shap.update_layout(
-                title="Top 10 SHAP features",
-                xaxis_title="SHAP value",
-                yaxis=dict(autorange="reversed"),
-                width=900,
-                height=500
-            )
+            fig_shap.update_layout(title="Top 10 SHAP features",
+                                   xaxis_title="SHAP value",
+                                   yaxis=dict(autorange="reversed"),
+                                   width=900, height=500)
 
-            return html.Div([
-                html.H3(score_text, style={"textAlign":"center"}),
-                dcc.Graph(figure=fig_gauge),
-                dcc.Graph(figure=fig_shap)
-            ])
+            return html.Div([html.H3(score_text, style={"textAlign":"center"}),
+                             dcc.Graph(figure=fig_gauge),
+                             dcc.Graph(figure=fig_shap)])
         else:
-            return html.Div([
-                html.H3(score_text, style={"textAlign":"center"}),
-                dcc.Graph(figure=fig_gauge)
-            ])
+            return html.Div([html.H3(score_text, style={"textAlign":"center"}),
+                             dcc.Graph(figure=fig_gauge)])
 
-    # ------------------- Tab Distribution -------------------
     elif tab=="tab-distrib":
-        return html.Div([
-            html.Label("Choisir une feature pour comparer le client :"),
-            dcc.Dropdown(
-                id="select-feature-distrib",
-                options=[{"label": f, "value": f} for f in top_features],
-                value=top_features[0],
-                clearable=False
-            ),
-            html.Div(id="output-hist-distrib")
-        ])
+        return html.Div([html.Label("Choisir une feature pour comparer le client :"),
+                         dcc.Dropdown(id="select-feature-distrib",
+                                      options=[{"label": f, "value": f} for f in top_features],
+                                      value=top_features[0],
+                                      clearable=False),
+                         html.Div(id="output-hist-distrib")])
 
-    # ------------------- Tab Scatter -------------------
     elif tab=="tab-scatter":
-        return html.Div([
-            html.Label("Choisir 2 features pour scatter plot :"),
-            dcc.Dropdown(
-                id="select-feature-scatter-x",
-                options=[{"label": f, "value": f} for f in top_features],
-                value=top_features[0],
-                clearable=False
-            ),
-            dcc.Dropdown(
-                id="select-feature-scatter-y",
-                options=[{"label": f, "value": f} for f in top_features],
-                value=top_features[1],
-                clearable=False
-            ),
-            html.Div(id="output-scatter")
-        ])
+        return html.Div([html.Label("Choisir 2 features pour scatter plot :"),
+                         dcc.Dropdown(id="select-feature-scatter-x",
+                                      options=[{"label": f, "value": f} for f in top_features],
+                                      value=top_features[0],
+                                      clearable=False),
+                         dcc.Dropdown(id="select-feature-scatter-y",
+                                      options=[{"label": f, "value": f} for f in top_features],
+                                      value=top_features[1],
+                                      clearable=False),
+                         html.Div(id="output-scatter")])
 
-    # ------------------- Tab Ajouter client -------------------
     elif tab=="tab-add-client":
         median_vals = clients_df.median()
         return html.Div([
@@ -289,7 +248,8 @@ def update_tabs(tab, selected_client):
             dcc.Input(id="new-client-name", type="text", value="Nouveau client"),
             html.Br(), html.Br(),
             *[html.Div([html.Label(f), dcc.Input(id=f"input-{f}", type="number",
-                value=float(median_vals[f]))]) for f in top_features]
+                                                 value=float(median_vals[f]))])
+              for f in top_features]
         ])
 
 # -----------------------
@@ -308,13 +268,8 @@ def update_hist(feature, selected_client):
 
     # Distribution globale
     fig_all = go.Figure()
-    fig_all.add_trace(go.Histogram(
-        x=df_plot[feature],
-        nbinsx=50,
-        name="Tous les clients",
-        opacity=0.5,
-        marker_color="royalblue"
-    ))
+    fig_all.add_trace(go.Histogram(x=df_plot[feature], nbinsx=50, name="Tous les clients",
+                                   opacity=0.5, marker_color="royalblue"))
     fig_all.add_vline(x=client_val, line_color="blue", line_width=3,
                       annotation_text="Client", annotation_position="top")
     fig_all.update_layout(title=f"Distribution globale de {feature}",
@@ -323,13 +278,8 @@ def update_hist(feature, selected_client):
 
     # Crédit accordé
     fig_target0 = go.Figure()
-    fig_target0.add_trace(go.Histogram(
-        x=df_plot[df_plot["TARGET"]==0][feature],
-        nbinsx=50,
-        name="Crédit accordé (0)",
-        opacity=0.7,
-        marker_color="green"
-    ))
+    fig_target0.add_trace(go.Histogram(x=df_plot[df_plot["TARGET"]==0][feature], nbinsx=50,
+                                       name="Crédit accordé (0)", opacity=0.7, marker_color="green"))
     fig_target0.add_vline(x=client_val, line_color="blue", line_width=3,
                           annotation_text="Client", annotation_position="top")
     fig_target0.update_layout(title=f"Crédit accordé (0) pour {feature}",
@@ -338,13 +288,8 @@ def update_hist(feature, selected_client):
 
     # Crédit refusé
     fig_target1 = go.Figure()
-    fig_target1.add_trace(go.Histogram(
-        x=df_plot[df_plot["TARGET"]==1][feature],
-        nbinsx=50,
-        name="Crédit refusé (1)",
-        opacity=0.7,
-        marker_color="red"
-    ))
+    fig_target1.add_trace(go.Histogram(x=df_plot[df_plot["TARGET"]==1][feature], nbinsx=50,
+                                       name="Crédit refusé (1)", opacity=0.7, marker_color="red"))
     fig_target1.add_vline(x=client_val, line_color="blue", line_width=3,
                           annotation_text="Client", annotation_position="top")
     fig_target1.update_layout(title=f"Crédit refusé (1) pour {feature}",
@@ -370,10 +315,8 @@ def update_scatter(x_feat, y_feat, selected_client):
     client_x = prepare_client_value(x_feat, client_data[x_feat])
     client_y = prepare_client_value(y_feat, client_data[y_feat])
 
-    fig_scatter = px.scatter(
-        df_graph.sample(n=min(5000,len(df_graph)), random_state=42),
-        x=x_feat, y=y_feat, opacity=0.3, title=f"{x_feat} vs {y_feat}"
-    )
+    fig_scatter = px.scatter(df_graph.sample(n=min(5000,len(df_graph)), random_state=42),
+                             x=x_feat, y=y_feat, opacity=0.3, title=f"{x_feat} vs {y_feat}")
     fig_scatter.add_scatter(x=[client_x], y=[client_y], mode="markers",
                             marker=dict(size=14,color="red"), name="Client")
     fig_scatter.add_vline(x=df_graph[x_feat].median(), line_dash="dash", line_color="black",
@@ -389,32 +332,31 @@ def update_scatter(x_feat, y_feat, selected_client):
 # -----------------------
 @app.callback(
     [Output("select-client","options"),
-     Output("select-client","value")], 
+     Output("select-client","value")],
     [Input("add-client-button","n_clicks")],
-    [State("new-client-name","value")] +
-    [State(f"input-{f}","value") for f in top_features]
+    [State("new-client-name","value")] + [State(f"input-{f}","value") for f in top_features]
 )
 def add_client(n_clicks, name, *vals):
     global clients_df
-
     if n_clicks > 0 and name:
         vals_dict = {f: v if v is not None else float(clients_df[f].median()) 
                      for f, v in zip(top_features, vals)}
         new_row = pd.DataFrame([vals_dict], index=[name])
         clients_df = pd.concat([new_row, clients_df])
-
-        # 🔹 Sauvegarde sur S3
         save_clients_to_s3(clients_df, MAIN_CLIENTS_FILE)
 
     options = [{"label": idx, "value": idx} for idx in clients_df.index]
     selected = name if n_clicks > 0 else clients_df.index[0]
-
     return options, selected
 
 # -----------------------
 # Run server
 # -----------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8050))
-    app.run_server(debug=True, host="0.0.0.0", port=port)
-
+    try:
+        port = int(os.environ.get("PORT", 8050))
+        app.run_server(debug=True, host="0.0.0.0", port=port)
+    except Exception as e:
+        print("Erreur au démarrage du serveur :")
+        traceback.print_exc()
+        raise

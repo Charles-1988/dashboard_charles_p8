@@ -45,7 +45,6 @@ try:
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY
     )
-    # Vérification rapide du bucket
     files = s3.list_objects_v2(Bucket=BUCKET_NAME)
     if 'Contents' in files:
         print("Fichiers dans le bucket :", [f["Key"] for f in files['Contents']])
@@ -62,21 +61,19 @@ except Exception as e:
 def load_clients_from_s3(filename, nrows=None):
     try:
         obj = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
-        data = json.load(obj["Body"])  
-        # Si c'est une dict, on prend ses valeurs
+        data = json.load(obj["Body"].read())  # Correction ici
         if isinstance(data, dict):
             data = list(data.values())
-        # Si nrows est défini, on prend juste les premières lignes
-        if nrows is not None:
-            data = data[:nrows]
         df = pd.DataFrame(data)
+        if nrows is not None:
+            df = df.head(nrows)
         df["source_file"] = filename
         return df
     except Exception as e:
         print(f"Erreur lors du chargement du fichier {filename} depuis S3 :")
         traceback.print_exc()
-        return pd.DataFrame()  # Retourne un DataFrame vide en cas d'erreur
-    
+        return pd.DataFrame()
+
 def save_clients_to_s3(df, filename):
     try:
         data = df.drop(columns=["source_file"], errors="ignore").to_dict(orient="records")
@@ -98,7 +95,6 @@ clients_df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=5000)
 clients_df = pd.concat([clients_df_main, clients_df_extra])
 df_compar = clients_df.copy()
 
-# Liste des features
 top_features = [f for f in clients_df.columns if f != "index"]
 
 # -----------------------
@@ -319,7 +315,10 @@ def update_scatter(x_feat, y_feat, selected_client):
     client_x = prepare_client_value(x_feat, client_data[x_feat])
     client_y = prepare_client_value(y_feat, client_data[y_feat])
 
-    fig_scatter = px.scatter(df_graph.sample(n=min(5000,len(df_graph)), random_state=42),
+    # Échantillonnage pour performance
+    df_sample = df_graph.sample(n=min(5000,len(df_graph)), random_state=42)
+
+    fig_scatter = px.scatter(df_sample,
                              x=x_feat, y=y_feat, opacity=0.3, title=f"{x_feat} vs {y_feat}")
     fig_scatter.add_scatter(x=[client_x], y=[client_y], mode="markers",
                             marker=dict(size=14,color="red"), name="Client")

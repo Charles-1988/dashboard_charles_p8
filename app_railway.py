@@ -9,6 +9,12 @@ from dash.dependencies import Input, Output, State
 import requests
 import plotly.express as px
 import plotly.graph_objects as go
+import logging
+
+# -----------------------
+# Logging
+# -----------------------
+logging.basicConfig(level=logging.INFO)
 
 # -----------------------
 # Vérification des variables d'environnement
@@ -32,9 +38,9 @@ API_PREDICT_URL = os.environ.get("API_PREDICT_URL")
 API_EXPLAIN_URL = os.environ.get("API_EXPLAIN_URL")
 
 if not API_PREDICT_URL:
-    print("⚠️ API_PREDICT_URL non défini ! Les prédictions ne fonctionneront pas.")
+    logging.warning("⚠️ API_PREDICT_URL non défini ! Les prédictions ne fonctionneront pas.")
 if not API_EXPLAIN_URL:
-    print("⚠️ API_EXPLAIN_URL non défini ! Les explications SHAP ne fonctionneront pas.")
+    logging.warning("⚠️ API_EXPLAIN_URL non défini ! Les explications SHAP ne fonctionneront pas.")
 
 # -----------------------
 # Connexion S3
@@ -47,19 +53,17 @@ try:
     )
     files = s3.list_objects_v2(Bucket=BUCKET_NAME)
     if 'Contents' in files:
-        print("Fichiers dans le bucket :", [f["Key"] for f in files['Contents']])
+        logging.info("Fichiers dans le bucket : %s", [f["Key"] for f in files['Contents']])
     else:
-        print("⚠️ Aucun fichier trouvé dans le bucket !")
-except Exception as e:
-    print("Erreur lors de la connexion S3 :")
-    traceback.print_exc()
+        logging.warning("⚠️ Aucun fichier trouvé dans le bucket !")
+except Exception:
+    logging.error("Erreur lors de la connexion S3 :", exc_info=True)
     raise
 
 # -----------------------
 # Fonctions S3
 # -----------------------
 def load_clients_from_s3(filename, features=None, nrows=None):
-    """Charge depuis S3 un JSON et ne garde que les colonnes nécessaires."""
     try:
         obj = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
         content = obj["Body"].read().decode("utf-8")
@@ -83,9 +87,8 @@ def load_clients_from_s3(filename, features=None, nrows=None):
         df["source_file"] = filename
         return df
 
-    except Exception as e:
-        print(f"Erreur lors du chargement du fichier {filename} depuis S3 :")
-        traceback.print_exc()
+    except Exception:
+        logging.error("Erreur lors du chargement du fichier %s depuis S3", filename, exc_info=True)
         return pd.DataFrame()
 
 def save_clients_to_s3(df, filename):
@@ -97,24 +100,8 @@ def save_clients_to_s3(df, filename):
             Body=json.dumps(data),
             ContentType="application/json"
         )
-    except Exception as e:
-        print(f"Erreur lors de la sauvegarde du fichier {filename} sur S3 :")
-        traceback.print_exc()
-
-# -----------------------
-# Définir les features importantes
-# -----------------------
-# On les définit dynamiquement depuis le main file (ou fixe)
-sample_df = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=5)
-top_features = [f for f in sample_df.columns if f != "TARGET"]
-
-# -----------------------
-# Chargement des clients (avec seulement les colonnes nécessaires)
-# -----------------------
-clients_df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, features=top_features, nrows=5000)
-clients_df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, features=top_features, nrows=5000)
-clients_df = pd.concat([clients_df_main, clients_df_extra])
-df_compar = clients_df.copy()
+    except Exception:
+        logging.error("Erreur lors de la sauvegarde du fichier %s sur S3", filename, exc_info=True)
 
 # -----------------------
 # Fonctions API
@@ -123,17 +110,17 @@ def call_api(url, payload):
     if not url:
         return None
     try:
-        res = requests.post(url, json=payload).json()
+        res = requests.post(url, json=payload, timeout=10).json()
         if "error" in res:
-            print(f"Erreur API {url}: {res['error']}")
+            logging.warning("Erreur API %s: %s", url, res["error"])
             return None
         return res
     except Exception as e:
-        print(f"Erreur API {url}: {e}")
+        logging.error("Erreur API %s : %s", url, e)
         return None
 
 # -----------------------
-# Fonctions utilitaires
+# Préparation des données
 # -----------------------
 def convert_days_birth(value):
     return int(-value / 365)
@@ -151,6 +138,20 @@ def prepare_dataframe(df, feat_list, sample_size=5000):
     return df_copy
 
 # -----------------------
+# Chargement des features
+# -----------------------
+sample_df = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=5)
+top_features = [f for f in sample_df.columns if f != "TARGET"]
+
+# -----------------------
+# Chargement des clients (dynamiquement et échantillonné)
+# -----------------------
+clients_df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, features=top_features, nrows=5000)
+clients_df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, features=top_features, nrows=5000)
+clients_df = pd.concat([clients_df_main, clients_df_extra])
+df_compar = clients_df.copy()
+
+# -----------------------
 # Dash App
 # -----------------------
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
@@ -162,7 +163,7 @@ app.title = "Dashboard Crédit"
 # -----------------------
 app.layout = html.Div([
     html.H1("Dashboard Crédit", style={"textAlign":"center"}),
-    html.Div([  
+    html.Div([
         html.Label("Choisir un client :"),
         dcc.Dropdown(
             id="select-client",
@@ -181,7 +182,7 @@ app.layout = html.Div([
 ])
 
 # -----------------------
-# Callback Tabs
+# Callbacks Tabs et Graphs
 # -----------------------
 @app.callback(
     Output("tabs-content", "children"),
@@ -195,16 +196,13 @@ def update_tabs(tab, selected_client):
     client_data = clients_df.loc[selected_client].to_dict()
     client_data = {feat: float(client_data.get(feat, 0)) for feat in top_features}
 
+    # ----- Gauge
     if tab=="tab-gauge":
         res = call_api(API_PREDICT_URL, client_data)
-        if res:
-            proba = res.get("proba",0)
-            classe = res.get("classe",0)
-            decision = "Crédit ACCORDÉ ✅" if classe==0 else "Crédit REFUSÉ ❌"
-            score_text = f"{selected_client} — Probabilité de défaut : {proba*100:.1f}% — {decision}"
-        else:
-            proba = 0
-            score_text = "Erreur API predict"
+        proba = res.get("proba",0) if res else 0
+        classe = res.get("classe",0) if res else 0
+        decision = "Crédit ACCORDÉ ✅" if classe==0 else "Crédit REFUSÉ ❌"
+        score_text = f"{selected_client} — Probabilité de défaut : {proba*100:.1f}% — {decision}" if res else "Erreur API predict"
 
         fig_gauge = go.Figure(go.Indicator(
             mode="gauge+number",
@@ -216,7 +214,10 @@ def update_tabs(tab, selected_client):
                             {'range':[90,100],'color':'red'}]}
         ))
 
+        # SHAP
         shap_res = call_api(API_EXPLAIN_URL, client_data)
+        children = [html.H3(score_text, style={"textAlign":"center"}),
+                    dcc.Loading(dcc.Graph(figure=fig_gauge), type="circle")]
         if shap_res:
             shap_vals = [shap_res.get(f,0) for f in top_features]
             shap_df = pd.DataFrame({"Feature": top_features, "SHAP": shap_vals})
@@ -232,18 +233,11 @@ def update_tabs(tab, selected_client):
                                    xaxis_title="SHAP value",
                                    yaxis=dict(autorange="reversed"),
                                    width=900, height=500)
+            children.append(dcc.Loading(dcc.Graph(figure=fig_shap), type="circle"))
 
-            return html.Div([
-                html.H3(score_text, style={"textAlign":"center"}),
-                dcc.Loading(dcc.Graph(figure=fig_gauge), type="circle"),
-                dcc.Loading(dcc.Graph(figure=fig_shap), type="circle")
-            ])
-        else:
-            return html.Div([
-                html.H3(score_text, style={"textAlign":"center"}),
-                dcc.Loading(dcc.Graph(figure=fig_gauge), type="circle")
-            ])
+        return html.Div(children)
 
+    # ----- Distribution
     elif tab=="tab-distrib":
         return html.Div([
             html.Label("Choisir une feature pour comparer le client :"),
@@ -254,6 +248,7 @@ def update_tabs(tab, selected_client):
             html.Div(id="output-hist-distrib")
         ])
 
+    # ----- Scatter
     elif tab=="tab-scatter":
         return html.Div([
             html.Label("Choisir 2 features pour scatter plot :"),
@@ -268,6 +263,7 @@ def update_tabs(tab, selected_client):
             html.Div(id="output-scatter")
         ])
 
+    # ----- Ajouter client
     elif tab=="tab-add-client":
         median_vals = clients_df.median()
         return html.Div([
@@ -298,40 +294,19 @@ def update_hist(feature, selected_client):
     # Échantillonnage
     df_plot_sample = df_plot.sample(n=min(5000,len(df_plot)), random_state=42)
 
-    # Distribution globale
-    fig_all = go.Figure()
-    fig_all.add_trace(go.Histogram(x=df_plot_sample[feature], nbinsx=50, name="Tous les clients",
-                                   opacity=0.5, marker_color="royalblue"))
-    fig_all.add_vline(x=client_val, line_color="blue", line_width=3,
+    def make_hist(data, title, color):
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=data, nbinsx=50, opacity=0.7, marker_color=color))
+        fig.add_vline(x=client_val, line_color="blue", line_width=3,
                       annotation_text="Client", annotation_position="top")
-    fig_all.update_layout(title=f"Distribution globale de {feature}",
-                          xaxis_title=feature, yaxis_title="Nombre de clients",
+        fig.update_layout(title=title, xaxis_title=feature, yaxis_title="Nombre de clients",
                           width=900, height=500)
-
-    # Crédit accordé
-    fig_target0 = go.Figure()
-    fig_target0.add_trace(go.Histogram(x=df_plot_sample[df_plot_sample["TARGET"]==0][feature], nbinsx=50,
-                                       name="Crédit accordé (0)", opacity=0.7, marker_color="green"))
-    fig_target0.add_vline(x=client_val, line_color="blue", line_width=3,
-                          annotation_text="Client", annotation_position="top")
-    fig_target0.update_layout(title=f"Crédit accordé (0) pour {feature}",
-                              xaxis_title=feature, yaxis_title="Nombre de clients",
-                              width=900, height=500)
-
-    # Crédit refusé
-    fig_target1 = go.Figure()
-    fig_target1.add_trace(go.Histogram(x=df_plot_sample[df_plot_sample["TARGET"]==1][feature], nbinsx=50,
-                                       name="Crédit refusé (1)", opacity=0.7, marker_color="red"))
-    fig_target1.add_vline(x=client_val, line_color="blue", line_width=3,
-                          annotation_text="Client", annotation_position="top")
-    fig_target1.update_layout(title=f"Crédit refusé (1) pour {feature}",
-                              xaxis_title=feature, yaxis_title="Nombre de clients",
-                              width=900, height=500)
+        return fig
 
     return html.Div([
-        dcc.Loading(dcc.Graph(figure=fig_all), type="circle"),
-        dcc.Loading(dcc.Graph(figure=fig_target0), type="circle"),
-        dcc.Loading(dcc.Graph(figure=fig_target1), type="circle")
+        dcc.Loading(dcc.Graph(figure=make_hist(df_plot_sample[feature], f"Distribution globale de {feature}", "royalblue")), type="circle"),
+        dcc.Loading(dcc.Graph(figure=make_hist(df_plot_sample[df_plot_sample["TARGET"]==0][feature], f"Crédit accordé (0) pour {feature}", "green")), type="circle"),
+        dcc.Loading(dcc.Graph(figure=make_hist(df_plot_sample[df_plot_sample["TARGET"]==1][feature], f"Crédit refusé (1) pour {feature}", "red")), type="circle")
     ])
 
 # -----------------------
@@ -389,8 +364,7 @@ def add_client(n_clicks, name, *vals):
 if __name__ == "__main__":
     try:
         port = int(os.environ.get("PORT", 8050))
-        app.run_server(debug=True, host="0.0.0.0", port=port)
-    except Exception as e:
-        print("Erreur au démarrage du serveur :")
-        traceback.print_exc()
+        app.run_server(debug=False, host="0.0.0.0", port=port)
+    except Exception:
+        logging.error("Erreur au démarrage du serveur :", exc_info=True)
         raise

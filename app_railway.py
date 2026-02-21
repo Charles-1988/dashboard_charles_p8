@@ -1,3 +1,45 @@
+import traceback
+
+try:
+    import os
+    import json
+    import boto3
+    import pandas as pd
+    from dash import Dash, dcc, html
+    # ... tous tes imports
+except Exception as e:
+    print("Erreur pendant les imports :")
+    traceback.print_exc()
+    raise
+
+# Ensuite ton code principal
+try:
+    # code principal : connexion S3, chargement fichiers, etc.
+    print("Variables d'environnement :")
+    print("AWS_ACCESS_KEY_ID:", os.environ.get("AWS_ACCESS_KEY_ID"))
+    print("BUCKET_NAME:", os.environ.get("BUCKET_NAME"))
+    print("MAIN_CLIENTS_FILE:", os.environ.get("CLIENTS_MAIN_FILE"))
+    print("COMPARE_CLIENTS_FILE:", os.environ.get("CLIENTS_COMPARE_FILE"))
+
+    # Test connexion S3
+    s3 = boto3.client(
+        's3',
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY")
+    )
+    # lister les fichiers pour vérifier
+    print("Fichiers dans le bucket :")
+    files = s3.list_objects_v2(Bucket=os.environ.get("BUCKET_NAME"))
+    if 'Contents' in files:
+        for f in files['Contents']:
+            print(f["Key"])
+    else:
+        print("Aucun fichier trouvé dans le bucket !")
+
+except Exception as e:
+    print("Erreur pendant le setup / S3 / variables :")
+    traceback.print_exc()
+    raise
 import dash
 from dash import html, dcc
 from dash.dependencies import Input, Output, State
@@ -29,16 +71,21 @@ s3 = boto3.client(
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-def load_clients_from_s3(filename):
+def load_clients_from_s3(filename, nrows=None):
+    """Charge les clients depuis S3. Si nrows est spécifié, ne prend que les n premières lignes."""
     obj = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
     data = json.load(obj["Body"])
+    
+    if nrows is not None:
+        data = data[:nrows]  
+    
     df = pd.DataFrame(data)
     df["source_file"] = filename
     return df
 
 # Chargement des clients
-clients_df_main = load_clients_from_s3(MAIN_CLIENTS_FILE)
-clients_df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE)
+clients_df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=5000)
+clients_df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=5000)
 
 # Dataframes concaténés
 clients_df = pd.concat([clients_df_main, clients_df_extra])

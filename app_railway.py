@@ -59,19 +59,40 @@ except Exception as e:
 # Fonctions S3
 # -----------------------
 def load_clients_from_s3(filename, nrows=None):
+    """
+    Charge un fichier JSON depuis S3 et le convertit en DataFrame Pandas.
+    
+    Args:
+        filename (str): Nom du fichier dans le bucket S3.
+        nrows (int, optional): Nombre de lignes à charger. Par défaut None (toutes les lignes).
+        
+    Returns:
+        pd.DataFrame: DataFrame contenant les données du fichier.
+    """
     try:
         obj = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
-        data = json.load(obj["Body"].read())  # Correction ici
+        # Lecture du contenu et décodage UTF-8
+        content = obj["Body"].read().decode("utf-8")
+        data = json.loads(content)
+
+        # Si c'est un dict, on prend juste les valeurs
         if isinstance(data, dict):
             data = list(data.values())
+
         df = pd.DataFrame(data)
+
+        # Limite des lignes si nrows est défini
         if nrows is not None:
             df = df.head(nrows)
+
+        # Ajouter le nom du fichier comme colonne
         df["source_file"] = filename
         return df
+
     except Exception as e:
         print(f"Erreur lors du chargement du fichier {filename} depuis S3 :")
         traceback.print_exc()
+        return pd.DataFrame()  # Retourne un DataFrame vide en cas d'erreur
         return pd.DataFrame()
 
 def save_clients_to_s3(df, filename):

@@ -64,7 +64,7 @@ def convert_days_birth(value):
 def prepare_client_value(feat, value):
     return convert_days_birth(value) if feat=="DAYS_BIRTH" else value
 
-def prepare_dataframe(df, feat_list, sample_size=5000):
+def prepare_dataframe(df, feat_list, sample_size=50):
     df_copy = df.copy()
     for feat in feat_list:
         if feat=="DAYS_BIRTH":
@@ -77,8 +77,8 @@ def prepare_dataframe(df, feat_list, sample_size=5000):
 sample_df = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=5)
 top_features = [f for f in sample_df.columns if f != "TARGET"]
 
-clients_df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, features=top_features, nrows=5000)
-clients_df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, features=top_features, nrows=5000)
+clients_df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, features=top_features, nrows=5)
+clients_df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, features=top_features, nrows=5)
 clients_df = pd.concat([clients_df_main, clients_df_extra])
 df_compar = clients_df.copy()
 

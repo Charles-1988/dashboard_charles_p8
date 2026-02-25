@@ -9,7 +9,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 
-# --- Variables d'environnement ---
+# ==============================
+# ENV VARIABLES
+# ==============================
+
 AWS_ACCESS_KEY_ID = os.environ["AWS_ACCESS_KEY_ID"]
 AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
 BUCKET_NAME = os.environ["BUCKET_NAME"]
@@ -18,256 +21,193 @@ COMPARE_CLIENTS_FILE = os.environ["CLIENTS_COMPARE_FILE"]
 API_PREDICT_URL = os.environ.get("API_PREDICT_URL")
 API_EXPLAIN_URL = os.environ.get("API_EXPLAIN_URL")
 
-# --- Connexion S3 ---
+# ==============================
+# S3 CONNECTION
+# ==============================
+
 s3 = boto3.client(
     "s3",
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-# --- Fonctions S3 ---
-def load_clients_from_s3(filename, features=None, nrows=None):
-    """Charge les données depuis S3 de façon sécurisée et échantillonnée."""
+def load_clients_from_s3(filename, nrows=None):
     obj = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
     data = json.loads(obj["Body"].read().decode("utf-8"))
     if isinstance(data, dict):
         data = list(data.values())
     df = pd.DataFrame(data)
-    if features:
-        keep_cols = [f for f in features if f in df.columns]
-        if "TARGET" in df.columns:
-            keep_cols.append("TARGET")
-        df = df[keep_cols]
-    if nrows is not None:
-        df = df.sample(n=min(nrows,len(df)), random_state=42)
-    df["source_file"] = filename
+    if nrows:
+        df = df.sample(n=min(nrows, len(df)), random_state=42)
     return df
 
 def save_clients_to_s3(df, filename):
-    data = df.drop(columns=["source_file"], errors="ignore").to_dict(orient="records")
-    s3.put_object(Bucket=BUCKET_NAME, Key=filename,
-                  Body=json.dumps(data), ContentType="application/json")
+    data = df.to_dict(orient="records")
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=filename,
+        Body=json.dumps(data),
+        ContentType="application/json"
+    )
 
-# --- Appel API ---
+# ==============================
+# INITIAL LOAD (IMPORTANT)
+# ==============================
+
+df_main_init = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=100)
+df_extra_init = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=100)
+clients_df_init = pd.concat([df_main_init, df_extra_init])
+
+top_features = [f for f in clients_df_init.columns if f != "TARGET"]
+
+# ==============================
+# API CALL
+# ==============================
+
 def call_api(url, payload):
     if not url:
         return None
     try:
-        res = requests.post(url, json=payload, timeout=10).json()
-        return res if "error" not in res else None
+        res = requests.post(url, json=payload, timeout=10)
+        return res.json()
     except:
         return None
 
-# --- Préparation des données ---
-def convert_days_birth(value):
-    return int(-value / 365)
+# ==============================
+# DASH APP
+# ==============================
 
-def prepare_client_value(feat, value):
-    return convert_days_birth(value) if feat=="DAYS_BIRTH" else value
-
-def prepare_dataframe(df, feat_list, sample_size=5000):
-    df_copy = df.copy()
-    for feat in feat_list:
-        if feat=="DAYS_BIRTH":
-            df_copy[feat] = df_copy[feat].apply(convert_days_birth)
-    if len(df_copy) > sample_size:
-        df_copy = df_copy.sample(n=sample_size, random_state=42)
-    return df_copy
-
-# --- Dash App ---
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
 app.title = "Dashboard Crédit"
 
-# --- Layout ---
 app.layout = html.Div([
     html.H1("Dashboard Crédit", style={"textAlign":"center"}),
-    html.Div([
-        html.Label("Choisir un client :"),
-        dcc.Dropdown(id="select-client")
-    ], style={"width":"40%","margin":"auto"}),
-    html.Br(),
+
+    html.Label("Choisir un client :"),
+    dcc.Dropdown(id="select-client"),
+
     dcc.Tabs(id="tabs-dashboard", value="tab-gauge", children=[
-        dcc.Tab(label="Risque de défaut", value="tab-gauge"),
-        dcc.Tab(label="Comparaison client", value="tab-distrib"),
-        dcc.Tab(label="Comparaison 2 features", value="tab-scatter"),
+        dcc.Tab(label="Risque", value="tab-gauge"),
+        dcc.Tab(label="Distribution", value="tab-distrib"),
+        dcc.Tab(label="Scatter", value="tab-scatter"),
         dcc.Tab(label="Nouveau client", value="tab-add-client")
     ]),
-    html.Div(id="tabs-content", style={"marginTop":20})
+
+    html.Div(id="tabs-content")
 ])
 
-# --- Callbacks pour initialiser le dropdown ---
+# ==============================
+# INIT DROPDOWN
+# ==============================
+
 @app.callback(
     Output("select-client","options"),
     Output("select-client","value"),
-    Input("tabs-dashboard","value")  # Trigger au chargement
+    Input("tabs-dashboard","value")
 )
 def init_clients(_):
     df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=50)
     df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=50)
-    df_combined = pd.concat([df_main, df_extra])
-    options = [{"label": idx, "value": idx} for idx in df_combined.index]
-    value = df_combined.index[0] if len(df_combined)>0 else None
+    df = pd.concat([df_main, df_extra])
+    df.index = df.index.astype(str)
+
+    options = [{"label": idx, "value": idx} for idx in df.index]
+    value = df.index[0] if len(df) > 0 else None
     return options, value
 
-# --- Callback pour le contenu des tabs ---
+# ==============================
+# MAIN TABS
+# ==============================
+
 @app.callback(
     Output("tabs-content","children"),
-    [Input("tabs-dashboard","value"),
-     Input("select-client","value")]
+    Input("tabs-dashboard","value"),
+    Input("select-client","value")
 )
 def update_tabs(tab, selected_client):
-    if selected_client is None:
+
+    if not selected_client:
         return html.Div("Aucun client disponible.")
-    
-    # Charger uniquement le client sélectionné
-    df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=50)
-    df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=50)
-    clients_df = pd.concat([df_main, df_extra])
-    top_features = [f for f in clients_df.columns if f != "TARGET"]
-    client_data = clients_df.loc[selected_client].to_dict()
-    client_data = {feat: float(client_data[feat]) for feat in top_features}
 
-    if tab=="tab-gauge":
-        # --- Appel API Predict ---
-        res = call_api(API_PREDICT_URL, client_data)
-        proba = res.get("proba",0) if res else 0
-        classe = res.get("classe",0) if res else 0
-        decision = "Crédit ACCORDÉ ✅" if classe==0 else "Crédit REFUSÉ ❌"
-        score_text = f"{selected_client} — Probabilité de défaut : {proba*100:.1f}% — {decision}" if res else "Erreur API predict"
+    df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=200)
+    df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=200)
+    df = pd.concat([df_main, df_extra])
+    df.index = df.index.astype(str)
 
-        fig_gauge = go.Figure(go.Indicator(
+    client_data = df.loc[selected_client].to_dict()
+    payload = {f: float(client_data[f]) for f in top_features}
+
+    if tab == "tab-gauge":
+        res = call_api(API_PREDICT_URL, payload)
+        proba = res.get("proba",0)*100 if res else 0
+
+        fig = go.Figure(go.Indicator(
             mode="gauge+number",
-            value=proba*100,
+            value=proba,
             title={'text': "Probabilité de défaut (%)"},
-            gauge={'axis': {'range':[0,100]},
-                   'bar': {'color': 'black'},
-                   'steps':[{'range':[0,90],'color':'green'},
-                            {'range':[90,100],'color':'red'}]}
+            gauge={'axis': {'range':[0,100]}}
         ))
 
-        # --- Appel API Explain ---
-        shap_res = call_api(API_EXPLAIN_URL, client_data)
-        children = [html.H3(score_text, style={"textAlign":"center"}), dcc.Graph(figure=fig_gauge)]
-        if shap_res:
-            shap_vals = [shap_res.get(f,0) for f in top_features]
-            shap_df = pd.DataFrame({"Feature": top_features, "SHAP": shap_vals})
-            shap_df = shap_df.reindex(shap_df["SHAP"].abs().sort_values(ascending=False).index).head(10)
-            fig_shap = go.Figure(go.Bar(
-                x=shap_df["SHAP"], y=shap_df["Feature"], orientation='h',
-                marker_color=['red' if v>0 else 'blue' for v in shap_df["SHAP"]]
-            ))
-            fig_shap.update_layout(title="Top 10 SHAP features", xaxis_title="SHAP value",
-                                   yaxis=dict(autorange="reversed"), width=900, height=500)
-            children.append(dcc.Graph(figure=fig_shap))
-        return html.Div(children)
+        return dcc.Graph(figure=fig)
 
-    elif tab=="tab-distrib":
+    elif tab == "tab-distrib":
+        feature = top_features[0]
+        fig = px.histogram(df, x=feature)
+        return dcc.Graph(figure=fig)
+
+    elif tab == "tab-scatter":
+        fig = px.scatter(df, x=top_features[0], y=top_features[1])
+        return dcc.Graph(figure=fig)
+
+    elif tab == "tab-add-client":
+        median_vals = df.median()
         return html.Div([
-            html.Label("Choisir une feature :"),
-            dcc.Dropdown(id="select-feature-distrib",
-                         options=[{"label": f, "value": f} for f in top_features],
-                         value=top_features[0]),
-            html.Div(id="output-hist-distrib")
+            html.Button("Ajouter", id="add-client-button"),
+            html.Br(),
+            dcc.Input(id="new-client-name", value="Nouveau client"),
+            html.Br(),
+            *[
+                html.Div([
+                    html.Label(f),
+                    dcc.Input(id=f"input-{f}", type="number", value=float(median_vals[f]))
+                ])
+                for f in top_features
+            ]
         ])
 
-    elif tab=="tab-scatter":
-        return html.Div([
-            html.Label("Choisir 2 features :"),
-            dcc.Dropdown(id="select-feature-scatter-x",
-                         options=[{"label": f, "value": f} for f in top_features],
-                         value=top_features[0]),
-            dcc.Dropdown(id="select-feature-scatter-y",
-                         options=[{"label": f, "value": f} for f in top_features],
-                         value=top_features[1]),
-            html.Div(id="output-scatter")
-        ])
+# ==============================
+# ADD CLIENT
+# ==============================
 
-    elif tab=="tab-add-client":
-        median_vals = clients_df.median()
-        return html.Div([
-            html.Button("Ajouter un client", id="add-client-button", n_clicks=0),
-            html.Br(), html.Br(),
-            html.Label("Nom du nouveau client :"),
-            dcc.Input(id="new-client-name", type="text", value="Nouveau client"),
-            html.Br(), html.Br(),
-            *[html.Div([html.Label(f), dcc.Input(id=f"input-{f}", type="number", value=float(median_vals[f]))])
-              for f in top_features]
-        ])
-
-# --- Callback Distribution ---
 @app.callback(
-    Output("output-hist-distrib","children"),
-    [Input("select-feature-distrib","value"),
-     Input("select-client","value")]
-)
-def update_hist(feature, selected_client):
-    df = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=5000)
-    df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=5000)
-    df_compar = pd.concat([df, df_extra])
-    client_val = prepare_client_value(feature, df_compar.loc[selected_client][feature])
-    if feature=="DAYS_BIRTH":
-        df_compar[feature] = df_compar[feature].apply(convert_days_birth)
-
-    df_plot_sample = df_compar.sample(n=min(5000,len(df_compar)), random_state=42)
-
-    def make_hist(data, title, color):
-        fig = go.Figure()
-        fig.add_trace(go.Histogram(x=data, nbinsx=50, opacity=0.7, marker_color=color))
-        fig.add_vline(x=client_val, line_color="blue", line_width=3, annotation_text="Client", annotation_position="top")
-        fig.update_layout(title=title, xaxis_title=feature, yaxis_title="Nombre de clients", width=900, height=500)
-        return fig
-
-    return html.Div([
-        dcc.Graph(figure=make_hist(df_plot_sample[feature], f"Distribution globale de {feature}", "royalblue")),
-        dcc.Graph(figure=make_hist(df_plot_sample[df_plot_sample["TARGET"]==0][feature], f"Crédit accordé (0) pour {feature}", "green")),
-        dcc.Graph(figure=make_hist(df_plot_sample[df_plot_sample["TARGET"]==1][feature], f"Crédit refusé (1) pour {feature}", "red"))
-    ])
-
-# --- Callback Scatter ---
-@app.callback(
-    Output("output-scatter","children"),
-    [Input("select-feature-scatter-x","value"),
-     Input("select-feature-scatter-y","value"),
-     Input("select-client","value")]
-)
-def update_scatter(x_feat, y_feat, selected_client):
-    df = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=5000)
-    df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=5000)
-    clients_df = pd.concat([df, df_extra])
-    top_features = [f for f in clients_df.columns if f != "TARGET"]
-    client_data = clients_df.loc[selected_client].to_dict()
-    df_graph = prepare_dataframe(clients_df, [x_feat, y_feat], sample_size=5000)
-    client_x = prepare_client_value(x_feat, client_data[x_feat])
-    client_y = prepare_client_value(y_feat, client_data[y_feat])
-
-    fig_scatter = px.scatter(df_graph, x=x_feat, y=y_feat, opacity=0.3, title=f"{x_feat} vs {y_feat}")
-    fig_scatter.add_scatter(x=[client_x], y=[client_y], mode="markers", marker=dict(size=14,color="red"), name="Client")
-    fig_scatter.add_vline(x=df_graph[x_feat].median(), line_dash="dash", line_color="black")
-    fig_scatter.add_hline(y=df_graph[y_feat].median(), line_dash="dash", line_color="black")
-    fig_scatter.update_layout(width=900, height=600)
-    return dcc.Graph(figure=fig_scatter)
-
-# --- Callback Ajouter client ---
-@app.callback(
-    [Output("select-client","options"), Output("select-client","value")],
-    [Input("add-client-button","n_clicks")],
-    [State("new-client-name","value")] + [State(f"input-{f}","value") for f in top_features]
+    Output("select-client","options"),
+    Output("select-client","value"),
+    Input("add-client-button","n_clicks"),
+    State("new-client-name","value"),
+    *[State(f"input-{f}","value") for f in top_features]
 )
 def add_client(n_clicks, name, *vals):
-    if n_clicks > 0 and name:
-        df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=5000)
-        df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=5000)
-        clients_df = pd.concat([df_main, df_extra])
-        vals_dict = {f: v for f, v in zip([f for f in clients_df.columns if f!="TARGET"], vals)}
-        new_row = pd.DataFrame([vals_dict], index=[name])
-        clients_df = pd.concat([new_row, clients_df])
-        save_clients_to_s3(clients_df, MAIN_CLIENTS_FILE)
-    options = [{"label": idx, "value": idx} for idx in clients_df.index]
-    selected = name if n_clicks > 0 else clients_df.index[0]
-    return options, selected
 
-# --- Run server ---
+    df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=5000)
+    df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=5000)
+    df = pd.concat([df_main, df_extra])
+
+    if n_clicks and name:
+        new_row = pd.DataFrame([dict(zip(top_features, vals))], index=[name])
+        df = pd.concat([new_row, df])
+        save_clients_to_s3(df, MAIN_CLIENTS_FILE)
+
+    df.index = df.index.astype(str)
+    options = [{"label": idx, "value": idx} for idx in df.index]
+    value = name if n_clicks and name else df.index[0]
+
+    return options, value
+
+# ==============================
+# RUN
+# ==============================
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8050))
-    app.run_server(debug=False, host="0.0.0.0", port=port)
+    app.run_server(host="0.0.0.0", port=port)

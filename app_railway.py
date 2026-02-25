@@ -9,6 +9,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import logging
+from functools import lru_cache
 
 # --- Logging pour debug ---
 logging.basicConfig(level=logging.INFO)
@@ -31,22 +32,38 @@ s3 = boto3.client(
 )
 
 # --- Fonctions S3 ---
-def load_clients_from_s3(filename, features=None, nrows=500):
-    """Charge les données depuis S3 de façon sécurisée et échantillonnée."""
+def load_clients_from_s3(filename, features=None, nrows=None):
+    """Charge les données depuis S3, échantillonnées si besoin."""
     obj = s3.get_object(Bucket=BUCKET_NAME, Key=filename)
     data = json.loads(obj["Body"].read().decode("utf-8"))
     if isinstance(data, dict):
         data = list(data.values())
     df = pd.DataFrame(data)
+    
+    # Optimisation types pandas
+    for col in df.select_dtypes('float'):
+        df[col] = df[col].astype('float32')
+    for col in df.select_dtypes('int'):
+        df[col] = df[col].astype('int32')
+    for col in df.select_dtypes('object'):
+        df[col] = df[col].astype('category')
+    
     if features:
         keep_cols = [f for f in features if f in df.columns]
         if "TARGET" in df.columns:
             keep_cols.append("TARGET")
         df = df[keep_cols]
-    if nrows is not None and len(df) > nrows:
-        df = df.sample(n=min(nrows,len(df)), random_state=42)
+    
+    if nrows and len(df) > nrows:
+        df = df.sample(n=nrows, random_state=42)
+    
     df["source_file"] = filename
     return df
+
+def load_client_by_index(filename, idx, features=None):
+    """Charge uniquement un client précis pour minimiser la RAM."""
+    df = load_clients_from_s3(filename, features=features, nrows=None)
+    return df.loc[[idx]] if idx in df.index else pd.DataFrame()
 
 def save_clients_to_s3(df, filename):
     data = df.drop(columns=["source_file"], errors="ignore").to_dict(orient="records")
@@ -54,7 +71,10 @@ def save_clients_to_s3(df, filename):
                   Body=json.dumps(data), ContentType="application/json")
 
 # --- API ---
-def call_api(url, payload):
+@lru_cache(maxsize=128)
+def call_api_cached(url, payload_str):
+    """Cache simple pour limiter les appels API répétitifs."""
+    payload = json.loads(payload_str)
     if not url:
         return None
     try:
@@ -64,12 +84,12 @@ def call_api(url, payload):
         logger.error("API call failed: %s", e)
         return None
 
+def call_api(url, payload):
+    return call_api_cached(json.dumps(payload), json.dumps(payload))
+
 # --- Préparation des données ---
 def convert_days_birth(value):
     return int(-value / 365)
-
-def prepare_client_value(feat, value):
-    return convert_days_birth(value) if feat=="DAYS_BIRTH" else value
 
 def prepare_dataframe(df, feat_list, sample_size=500):
     df_copy = df.copy()
@@ -85,13 +105,21 @@ app = dash.Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
 app.title = "Dashboard Crédit"
 
+# --- Précharger uniquement les index pour dropdown ---
+df_main_idx = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=200)
+df_extra_idx = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=200)
+df_clients_index = pd.concat([df_main_idx, df_extra_idx])
+client_options = [{"label": idx, "value": idx} for idx in df_clients_index.index]
+
 # --- Layout ---
 app.layout = html.Div([
     html.H1("Dashboard Crédit", style={"textAlign":"center"}),
     html.Div([
         html.Label("Choisir un client :"),
-        dcc.Dropdown(id="select-client")
+        dcc.Dropdown(id="select-client", options=client_options,
+                     value=client_options[0]['value'] if client_options else None)
     ], style={"width":"40%","margin":"auto"}),
+    dcc.Store(id='store-client-data'),  # pour stocker les données du client
     html.Br(),
     dcc.Tabs(id="tabs-dashboard", value="tab-gauge", children=[
         dcc.Tab(label="Risque de défaut", value="tab-gauge"),
@@ -102,37 +130,33 @@ app.layout = html.Div([
     html.Div(id="tabs-content", style={"marginTop":20})
 ])
 
-# --- Initialisation du dropdown ---
+# --- Stocker les données du client sélectionné ---
 @app.callback(
-    Output("select-client","options"),
-    Output("select-client","value"),
-    Input("tabs-dashboard","value")
+    Output("store-client-data","data"),
+    Input("select-client","value")
 )
-def init_clients(_):
-    df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=500)
-    df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=500)
-    df_combined = pd.concat([df_main, df_extra])
-    options = [{"label": idx, "value": idx} for idx in df_combined.index]
-    value = df_combined.index[0] if len(df_combined) > 0 else None
-    return options, value
+def load_selected_client(selected_client):
+    if not selected_client:
+        return {}
+    df_main = load_client_by_index(MAIN_CLIENTS_FILE, selected_client)
+    df_extra = load_client_by_index(COMPARE_CLIENTS_FILE, selected_client)
+    df = pd.concat([df_main, df_extra])
+    if df.empty:
+        return {}
+    data = df.iloc[0].to_dict()
+    return data
 
 # --- Contenu des tabs ---
 @app.callback(
     Output("tabs-content","children"),
-    [Input("tabs-dashboard","value"),
-     Input("select-client","value")]
+    Input("tabs-dashboard","value"),
+    State("store-client-data","data")
 )
-def update_tabs(tab, selected_client):
-    if selected_client is None:
+def update_tabs(tab, client_data):
+    if not client_data:
         return html.Div("Aucun client disponible.")
 
-    df_main = load_clients_from_s3(MAIN_CLIENTS_FILE, nrows=500)
-    df_extra = load_clients_from_s3(COMPARE_CLIENTS_FILE, nrows=500)
-    clients_df = pd.concat([df_main, df_extra])
-    top_features = [f for f in clients_df.columns if f != "TARGET"]
-
-    client_data = clients_df.loc[selected_client].to_dict()
-    client_data = {feat: float(client_data[feat]) for feat in top_features}
+    top_features = [f for f in client_data.keys() if f != "TARGET"]
 
     # --- Tab Risque ---
     if tab=="tab-gauge":
@@ -140,7 +164,7 @@ def update_tabs(tab, selected_client):
         proba = res.get("proba",0) if res else 0
         classe = res.get("classe",0) if res else 0
         decision = "Crédit ACCORDÉ ✅" if classe==0 else "Crédit REFUSÉ ❌"
-        score_text = f"{selected_client} — Probabilité de défaut : {proba*100:.1f}% — {decision}" if res else "Erreur API predict"
+        score_text = f"{client_data.get('client_name','Client')} — Probabilité de défaut : {proba*100:.1f}% — {decision}" if res else "Erreur API predict"
 
         fig_gauge = go.Figure(go.Indicator(
             mode="gauge+number",
@@ -169,6 +193,7 @@ def update_tabs(tab, selected_client):
 
     # --- Tab Distribution ---
     elif tab=="tab-distrib":
+        df_sample = prepare_dataframe(pd.DataFrame([client_data]), top_features, sample_size=200)
         return html.Div([
             html.Label("Choisir une feature :"),
             dcc.Dropdown(id="select-feature-distrib",
@@ -179,6 +204,7 @@ def update_tabs(tab, selected_client):
 
     # --- Tab Scatter ---
     elif tab=="tab-scatter":
+        df_sample = prepare_dataframe(pd.DataFrame([client_data]), top_features, sample_size=200)
         return html.Div([
             html.Label("Choisir 2 features :"),
             dcc.Dropdown(id="select-feature-scatter-x",
@@ -192,7 +218,7 @@ def update_tabs(tab, selected_client):
 
     # --- Tab Ajouter client ---
     elif tab=="tab-add-client":
-        median_vals = clients_df.median()
+        median_vals = pd.DataFrame([client_data]).median()
         return html.Div([
             html.Button("Ajouter un client", id="add-client-button", n_clicks=0),
             html.Br(), html.Br(),
